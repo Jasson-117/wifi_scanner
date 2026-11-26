@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Wi-Fi Scanner</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; padding: 16px; max-width: 960px; margin-inline: auto; }
+  h1 { font-size: 1.3rem; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  button { padding: 8px 16px; font-size: 1rem; border-radius: 6px; border: 1px solid #888; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #scan { background: #1976d2; color: #fff; border-color: #1976d2; }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid #8884; text-align: left; white-space: nowrap; }
+  th { position: sticky; top: 0; background: Canvas; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h1>Escáner Wi-Fi (ESP32)</h1>
+<div class="bar">
+  <button id="scan">Iniciar escaneo</button>
+  <button id="csv" disabled>Descargar CSV</button>
+  <span id="status"></span>
+</div>
+<div class="wrap">
+  <table>
+    <thead>
+      <tr><th>SSID</th><th>BSSID</th><th>Canal</th><th>RSSI</th><th>PHY</th><th>Auth</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let last = null;
+
+function render(data) {
+  const tbody = $('rows');
+  tbody.replaceChildren();
+  for (const ap of data.aps) {
+    const tr = document.createElement('tr');
+    const cells = [
+      [ap.ssid || '<OCULTO>', ''],
+      [ap.bssid, ''],
+      [`${ap.primary}(${ap.channel})`, 'num'],
+      [`${ap.rssi} dBm`, 'num'],
+      [ap.phy, ''],
+      [ap.auth, '']
+    ];
+    for (const [text, cls] of cells) {
+      const td = document.createElement('td');
+      td.textContent = text;
+      if (cls) td.className = cls;
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+}
+
+async function scan() {
+  const btn = $('scan');
+  btn.disabled = true;
+  $('status').textContent = 'Escaneando…';
+  try {
+    const r = await fetch('/api/scan');
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+    last = data;
+    render(data);
+    $('status').textContent = `Total: ${data.total} (mostrando ${data.shown})`;
+    $('csv').disabled = false;
+  } catch (e) {
+    $('status').textContent = 'Error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function downloadCsv() {
+  if (!last) return;
+  const q = s => '"' + String(s).replace(/"/g, '""') + '"';
+  const lines = ['timestamp_ms,ssid,bssid,channel,real_channel,rssi,auth,phy'];
+  for (const ap of last.aps) {
+    lines.push([last.timestamp_ms, q(ap.ssid || '(hidden)'), ap.bssid,
+                ap.primary, ap.channel, ap.rssi, q(ap.auth), ap.phy].join(','));
+  }
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'redes_wifi.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$('scan').addEventListener('click', scan);
+$('csv').addEventListener('click', downloadCsv);
+</script>
+</body>
+</html>

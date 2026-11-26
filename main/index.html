@@ -3,33 +3,63 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ESP32 Wi-Fi Scanner</title>
+<title>ESP32 Wi-Fi Radar</title>
 <style>
-  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-  body { margin: 0; padding: 16px; max-width: 960px; margin-inline: auto; }
-  h1 { font-size: 1.3rem; }
-  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-  button { padding: 8px 16px; font-size: 1rem; border-radius: 6px; border: 1px solid #888; cursor: pointer; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
+  :root {
+    color-scheme: light dark;
+    font-family: system-ui, sans-serif;
+    --good: #2e9e4f; --ok: #1e7ad9; --warn: #d98a00; --bad: #d9372b; --none: #888;
+  }
+  body { margin: 0; padding: 16px; max-width: 1100px; margin-inline: auto; }
+  h1 { font-size: 1.3rem; margin-top: 0; }
+  h2 { font-size: .85rem; margin: 0 0 4px; opacity: .7; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  button { font: inherit; }
+  .btn { padding: 8px 16px; font-size: 1rem; border-radius: 6px; border: 1px solid #888; cursor: pointer; background: transparent; color: inherit; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
   #scan { background: #1976d2; color: #fff; border-color: #1976d2; }
+
+  /* Resumen / filtros */
+  #summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .group { border: 1px solid #8884; border-radius: 8px; padding: 10px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { cursor: pointer; border-radius: 999px; padding: 3px 10px; font-size: .85rem;
+          border: 1px solid var(--c, var(--none)); background: color-mix(in srgb, var(--c, var(--none)) 15%, transparent);
+          color: inherit; }
+  .chip.active { background: var(--c, var(--none)); color: #fff; }
+  .good { --c: var(--good); } .ok { --c: var(--ok); } .warn { --c: var(--warn); } .bad { --c: var(--bad); }
+
+  /* Tabla */
   .wrap { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: .9rem; }
   th, td { padding: 6px 10px; border-bottom: 1px solid #8884; text-align: left; white-space: nowrap; }
   th { position: sticky; top: 0; background: Canvas; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; border-radius: 999px; padding: 1px 8px; font-size: .8rem;
+           border: 1px solid var(--c, var(--none)); background: color-mix(in srgb, var(--c, var(--none)) 18%, transparent); }
+  .meter { display: inline-block; width: 46px; height: 6px; border-radius: 3px; background: #8883; margin-right: 6px; vertical-align: middle; overflow: hidden; }
+  .meter > i { display: block; height: 100%; background: var(--c, var(--none)); }
+  .muted { opacity: .6; }
 </style>
 </head>
 <body>
-<h1>Escáner Wi-Fi (ESP32)</h1>
+<h1>Wi-Fi Radar (ESP32-S3)</h1>
+
 <div class="bar">
-  <button id="scan">Iniciar escaneo</button>
-  <button id="csv" disabled>Descargar CSV</button>
+  <button class="btn" id="scan">Iniciar escaneo</button>
+  <button class="btn" id="csv" disabled>Descargar CSV</button>
   <span id="status"></span>
 </div>
+
+<div id="summary"></div>
+
 <div class="wrap">
   <table>
     <thead>
-      <tr><th>SSID</th><th>BSSID</th><th>Canal</th><th>RSSI</th><th>PHY</th><th>Auth</th></tr>
+      <tr>
+        <th>SSID</th><th>BSSID</th><th>Canal</th><th>RSSI</th><th>Señal</th>
+        <th>Seguridad</th><th>Ancho</th><th>Estándar</th><th>Notas</th>
+      </tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
@@ -37,31 +67,168 @@
 
 <script>
 const $ = id => document.getElementById(id);
-let last = null;
 
-function render(data) {
+/* ---------------- Reglas de clasificación ---------------- */
+const SEC = {
+  'OPEN':          { label: 'Abierta',   level: 'bad',  note: 'Sin cifrado' },
+  'WEP':           { label: 'WEP',       level: 'bad',  note: 'Obsoleta e insegura' },
+  'WPA_PSK':       { label: 'WPA',       level: 'warn', note: 'Antigua, débil' },
+  'WPA/WPA2_PSK':  { label: 'WPA/WPA2',  level: 'warn', note: 'Modo mixto por compatibilidad' },
+  'WPA2_PSK':      { label: 'WPA2',      level: 'ok',   note: 'Estándar actual' },
+  'WPA2/WPA3_PSK': { label: 'WPA2/WPA3', level: 'good', note: 'Transición a WPA3' },
+  'WPA3_PSK':      { label: 'WPA3',      level: 'good', note: 'La más segura (personal)' },
+  'OWE':           { label: 'OWE',       level: 'good', note: 'Abierta pero con cifrado' },
+  'WPA3_ENT_192':  { label: 'WPA3-Ent',  level: 'good', note: 'Empresarial 192 bits' },
+  'WAPI_PSK':      { label: 'WAPI',      level: 'ok',   note: 'Estándar chino WAPI' }
+};
+
+function signalClass(rssi) {
+  if (rssi >= -50) return { label: 'Excelente', level: 'good' };
+  if (rssi >= -60) return { label: 'Muy buena', level: 'good' };
+  if (rssi >= -70) return { label: 'Buena',     level: 'ok' };
+  if (rssi >= -80) return { label: 'Débil',     level: 'warn' };
+  return { label: 'Muy débil', level: 'bad' };
+}
+
+function standardClass(phy) {
+  if (phy.includes('n')) return 'Wi-Fi 4 (n)';
+  if (phy.includes('g')) return 'Legacy (b/g)';
+  if (phy.includes('b')) return 'Legacy (b)';
+  return 'Desconocido';
+}
+
+function enrich(aps) {
+  const perSsid = {};
+  for (const ap of aps) if (ap.ssid) perSsid[ap.ssid] = (perSsid[ap.ssid] || 0) + 1;
+  return aps.map(ap => ({
+    ...ap,
+    sec: SEC[ap.auth] || { label: ap.auth, level: '', note: 'Desconocida' },
+    sig: signalClass(ap.rssi),
+    bw: ap.primary !== ap.channel ? 40 : 20,   // HT40 si hay canal secundario
+    std: standardClass(ap.phy),
+    hidden: !ap.ssid,
+    multi: ap.ssid ? perSsid[ap.ssid] : 1
+  }));
+}
+
+/* Grupos de resumen: cada get devuelve la lista de valores del AP en ese grupo */
+const GROUPS = [
+  { key: 'sec',  title: 'Seguridad',      get: a => [a.sec.label], level: a => a.sec.level },
+  { key: 'sig',  title: 'Señal',          get: a => [a.sig.label], level: a => a.sig.level },
+  { key: 'bw',   title: 'Ancho de canal', get: a => [a.bw + ' MHz'] },
+  { key: 'std',  title: 'Estándar',       get: a => [a.std] },
+  { key: 'flag', title: 'Notas',          get: a => [a.hidden ? 'Oculta' : null, a.multi > 1 ? 'Multi-AP' : null].filter(Boolean) }
+];
+
+/* ---------------- Estado y render ---------------- */
+let last = null;      // respuesta cruda del ESP32
+let aps = [];         // redes ya clasificadas
+let filter = null;    // { key, value } o null
+
+function levelOf(group, value) {
+  if (!group.level) return '';
+  const ap = aps.find(a => group.get(a).includes(value));
+  return ap ? group.level(ap) : '';
+}
+
+function renderSummary() {
+  const box = $('summary');
+  box.replaceChildren();
+  for (const g of GROUPS) {
+    const counts = {};
+    for (const a of aps) for (const v of g.get(a)) counts[v] = (counts[v] || 0) + 1;
+    const entries = Object.entries(counts).sort((x, y) => y[1] - x[1]);
+    if (!entries.length) continue;
+
+    const div = document.createElement('div');
+    div.className = 'group';
+    const h = document.createElement('h2');
+    h.textContent = g.title;
+    const chips = document.createElement('div');
+    chips.className = 'chips';
+
+    for (const [value, n] of entries) {
+      const b = document.createElement('button');
+      b.className = 'chip ' + levelOf(g, value);
+      if (filter && filter.key === g.key && filter.value === value) b.classList.add('active');
+      b.textContent = `${value} · ${n}`;
+      b.title = 'Clic para filtrar';
+      b.addEventListener('click', () => {
+        const same = filter && filter.key === g.key && filter.value === value;
+        filter = same ? null : { key: g.key, value };
+        render();
+      });
+      chips.appendChild(b);
+    }
+    div.append(h, chips);
+    box.appendChild(div);
+  }
+}
+
+function badge(text, level, title) {
+  const s = document.createElement('span');
+  s.className = 'badge ' + (level || '');
+  s.textContent = text;
+  if (title) s.title = title;
+  return s;
+}
+
+function signalCell(ap) {
+  const wrap = document.createElement('span');
+  const m = document.createElement('span');
+  m.className = 'meter ' + ap.sig.level;
+  const i = document.createElement('i');
+  const pct = Math.max(0, Math.min(100, ((ap.rssi + 100) / 60) * 100));
+  i.style.width = pct + '%';
+  m.appendChild(i);
+  wrap.append(m, badge(ap.sig.label, ap.sig.level));
+  return wrap;
+}
+
+function renderRows() {
   const tbody = $('rows');
   tbody.replaceChildren();
-  for (const ap of data.aps) {
+  const group = filter ? GROUPS.find(g => g.key === filter.key) : null;
+  const visible = filter ? aps.filter(a => group.get(a).includes(filter.value)) : aps;
+
+  for (const ap of visible) {
     const tr = document.createElement('tr');
+    const notes = [];
+    if (ap.hidden) notes.push('Oculta');
+    if (ap.multi > 1) notes.push(`Multi-AP (${ap.multi})`);
+
     const cells = [
-      [ap.ssid || '<OCULTO>', ''],
+      [ap.ssid || '<OCULTO>', ap.hidden ? 'muted' : ''],
       [ap.bssid, ''],
       [`${ap.primary}(${ap.channel})`, 'num'],
       [`${ap.rssi} dBm`, 'num'],
-      [ap.phy, ''],
-      [ap.auth, '']
+      [signalCell(ap), ''],
+      [badge(ap.sec.label, ap.sec.level, ap.sec.note), ''],
+      [`${ap.bw} MHz`, 'num'],
+      [ap.std, ''],
+      [notes.join(', '), 'muted']
     ];
-    for (const [text, cls] of cells) {
+    for (const [content, cls] of cells) {
       const td = document.createElement('td');
-      td.textContent = text;
+      if (typeof content === 'string') td.textContent = content;
+      else td.appendChild(content);
       if (cls) td.className = cls;
       tr.appendChild(td);
     }
     tbody.appendChild(tr);
   }
+  return visible.length;
 }
 
+function render() {
+  renderSummary();
+  const shown = renderRows();
+  let msg = `Total: ${last.total} (mostrando ${last.shown})`;
+  if (filter) msg += ` · Filtro: ${filter.value} (${shown} redes)`;
+  $('status').textContent = msg;
+}
+
+/* ---------------- Escaneo y CSV ---------------- */
 async function scan() {
   const btn = $('scan');
   btn.disabled = true;
@@ -71,8 +238,9 @@ async function scan() {
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || r.status);
     last = data;
-    render(data);
-    $('status').textContent = `Total: ${data.total} (mostrando ${data.shown})`;
+    aps = enrich(data.aps);
+    filter = null;
+    render();
     $('csv').disabled = false;
   } catch (e) {
     $('status').textContent = 'Error: ' + e.message;
@@ -84,10 +252,14 @@ async function scan() {
 function downloadCsv() {
   if (!last) return;
   const q = s => '"' + String(s).replace(/"/g, '""') + '"';
-  const lines = ['timestamp_ms,ssid,bssid,channel,real_channel,rssi,auth,phy'];
-  for (const ap of last.aps) {
-    lines.push([last.timestamp_ms, q(ap.ssid || '(hidden)'), ap.bssid,
-                ap.primary, ap.channel, ap.rssi, q(ap.auth), ap.phy].join(','));
+  const lines = ['timestamp_ms,ssid,bssid,channel,real_channel,rssi,auth,phy,seguridad,senal,ancho_mhz,estandar,oculta,multi_ap'];
+  for (const ap of aps) {
+    lines.push([
+      last.timestamp_ms, q(ap.ssid || '(hidden)'), ap.bssid,
+      ap.primary, ap.channel, ap.rssi, q(ap.auth), ap.phy,
+      q(ap.sec.label), q(ap.sig.label), ap.bw, q(ap.std),
+      ap.hidden ? 1 : 0, ap.multi
+    ].join(','));
   }
   const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv' });
   const a = document.createElement('a');
