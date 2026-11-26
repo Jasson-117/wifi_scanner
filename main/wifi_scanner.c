@@ -3,18 +3,33 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_http_server.h"
+
+/* ---------- Configura tu red (solo 2.4 GHz) ---------- */
+#define WIFI_SSID "fh_0ef478"
+#define WIFI_PASS "wlanf10b87"
 
 #define MAX_AP_RECORDS 32
-#define SCAN_INTERVAL_MS 10000   /* reescanea cada 10 s */
+#define GOT_IP_BIT     BIT0
 
 static const char *TAG = "WIFI_SCAN";
+static EventGroupHandle_t s_wifi_events;
+static SemaphoreHandle_t s_scan_mutex;
 
+/* index.html embebido en el binario (ver CMakeLists.txt) */
+extern const char index_html_start[] asm("_binary_index_html_start");
+
+/* ------------------------------------------------------------------ */
+/*  Utilidades (las mismas de tu código original)                      */
+/* ------------------------------------------------------------------ */
 static const char *auth_mode_to_str(wifi_auth_mode_t authmode)
 {
     switch (authmode) {
@@ -63,7 +78,28 @@ static int real_channel(const wifi_ap_record_t *ap)
     return ap->primary;
 }
 
-static void escanear_y_mostrar_redes(void)
+/* Escapa un string para ponerlo dentro de un JSON */
+static void json_escape(const char *in, char *out, size_t out_size)
+{
+    size_t o = 0;
+    for (; *in && o + 7 < out_size; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c == '"' || c == '\\') {
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c < 0x20) {
+            o += snprintf(out + o, out_size - o, "\\u%04X", c);
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* ------------------------------------------------------------------ */
+/*  Escaneo                                                            */
+/* ------------------------------------------------------------------ */
+static esp_err_t do_scan(wifi_ap_record_t **out, uint16_t *n_out, uint16_t *total_out)
 {
     wifi_scan_config_t scan_config = {
         .ssid = NULL,
@@ -75,57 +111,136 @@ static void escanear_y_mostrar_redes(void)
         .scan_time.active.max = 300,
     };
 
-    ESP_LOGI(TAG, "Iniciando escaneo Wi-Fi...");
-    if (esp_wifi_scan_start(&scan_config, true) != ESP_OK) {
-        ESP_LOGE(TAG, "Error al iniciar escaneo");
+    *out = NULL;
+    *n_out = 0;
+    *total_out = 0;
+
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) return err;
+
+    uint16_t total = 0;
+    err = esp_wifi_scan_get_ap_num(&total);
+    if (err != ESP_OK) return err;
+    *total_out = total;
+    if (total == 0) return ESP_OK;
+
+    uint16_t n = (total > MAX_AP_RECORDS) ? MAX_AP_RECORDS : total;
+    wifi_ap_record_t *recs = calloc(n, sizeof(*recs));
+    if (!recs) return ESP_ERR_NO_MEM;
+
+    err = esp_wifi_scan_get_ap_records(&n, recs);
+    if (err != ESP_OK) {
+        free(recs);
+        return err;
+    }
+    qsort(recs, n, sizeof(*recs), cmp_rssi_desc);
+
+    *out = recs;
+    *n_out = n;
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Servidor web                                                       */
+/* ------------------------------------------------------------------ */
+static esp_err_t send_error(httpd_req_t *req, const char *status, const char *msg)
+{
+    char body[96];
+    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg);
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t index_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, index_html_start, HTTPD_RESP_USE_STRLEN);
+}
+
+/* GET /api/scan -> ejecuta el escaneo y devuelve JSON */
+static esp_err_t scan_handler(httpd_req_t *req)
+{
+    if (xSemaphoreTake(s_scan_mutex, 0) != pdTRUE) {
+        return send_error(req, "409 Conflict", "Ya hay un escaneo en curso");
+    }
+
+    wifi_ap_record_t *recs = NULL;
+    uint16_t n = 0, total = 0;
+    esp_err_t err = do_scan(&recs, &n, &total);
+    xSemaphoreGive(s_scan_mutex);
+
+    if (err != ESP_OK) {
+        return send_error(req, "500 Internal Server Error", "Error al escanear, intenta de nuevo");
+    }
+
+    int64_t ts = esp_timer_get_time() / 1000;
+    char buf[420];
+
+    httpd_resp_set_type(req, "application/json");
+    int len = snprintf(buf, sizeof(buf),
+                       "{\"timestamp_ms\":%lld,\"total\":%u,\"shown\":%u,\"aps\":[",
+                       (long long)ts, total, n);
+    httpd_resp_send_chunk(req, buf, len);
+
+    for (uint16_t i = 0; i < n; i++) {
+        char ssid_esc[200], bssid[18], phy[8];
+        mac_to_str(recs[i].bssid, bssid);
+        phy_to_str(&recs[i], phy);
+        json_escape((const char *)recs[i].ssid, ssid_esc, sizeof(ssid_esc));
+
+        len = snprintf(buf, sizeof(buf),
+                       "%s{\"ssid\":\"%s\",\"bssid\":\"%s\",\"primary\":%d,\"channel\":%d,"
+                       "\"rssi\":%d,\"phy\":\"%s\",\"auth\":\"%s\"}",
+                       i ? "," : "", ssid_esc, bssid,
+                       recs[i].primary, real_channel(&recs[i]),
+                       recs[i].rssi, phy, auth_mode_to_str(recs[i].authmode));
+        httpd_resp_send_chunk(req, buf, len);
+    }
+
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0);   /* fin de la respuesta */
+
+    free(recs);
+    return ESP_OK;
+}
+
+static void start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
+
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo iniciar el servidor web");
         return;
     }
 
-    uint16_t ap_count = 0;
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
-    if (ap_count == 0) { ESP_LOGW(TAG, "Sin redes."); return; }
+    static const httpd_uri_t index_uri = {
+        .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL
+    };
+    static const httpd_uri_t scan_uri = {
+        .uri = "/api/scan", .method = HTTP_GET, .handler = scan_handler, .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &index_uri);
+    httpd_register_uri_handler(server, &scan_uri);
+}
 
-    uint16_t n = (ap_count > MAX_AP_RECORDS) ? MAX_AP_RECORDS : ap_count;
-    wifi_ap_record_t *recs = calloc(n, sizeof(*recs));
-    if (!recs) { ESP_LOGE(TAG, "calloc falló"); return; }
-
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&n, recs));
-    qsort(recs, n, sizeof(*recs), cmp_rssi_desc);
-
-    /* --- Tabla legible --- */
-    printf("\n%-24s | %-17s | %-5s | %-8s | %-6s | %-14s\n",
-           "SSID", "BSSID", "Canal", "RSSI", "PHY", "Auth");
-    printf("------------------------------------------------------------------------------------------\n");
-    for (uint16_t i = 0; i < n; i++) {
-        char bssid[18], phy[8];
-        mac_to_str(recs[i].bssid, bssid);
-        phy_to_str(&recs[i], phy);
-        const char *ssid = recs[i].ssid[0] ? (const char *)recs[i].ssid : "<OCULTO>";
-        printf("%-24.24s | %-17s | %2d(%2d) | %4d dBm | %-6s | %-14s\n",
-               ssid, bssid,
-               recs[i].primary, real_channel(&recs[i]),
-               recs[i].rssi, phy,
-               auth_mode_to_str(recs[i].authmode));
+/* ------------------------------------------------------------------ */
+/*  Wi-Fi (STA) y arranque                                             */
+/* ------------------------------------------------------------------ */
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();                       /* reintenta siempre */
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        /* Único mensaje por consola: la IP para entrar a la página. */
+        ESP_LOGI(TAG, "Abre en tu navegador: http://" IPSTR, IP2STR(&e->ip_info.ip));
+        xEventGroupSetBits(s_wifi_events, GOT_IP_BIT);
     }
-    printf("Total: %u (mostrando %u)\n\n", ap_count, n);
-
-    /* --- CSV exportable (cópialo a un archivo .csv y ábrelo en Excel/Python) --- */
-    printf("#CSV_START,timestamp_ms,ssid,bssid,channel,sec_channel,rssi,auth,phy\n");
-    int64_t ts = esp_timer_get_time() / 1000;
-    for (uint16_t i = 0; i < n; i++) {
-        char bssid[18], phy[8];
-        mac_to_str(recs[i].bssid, bssid);
-        phy_to_str(&recs[i], phy);
-        const char *ssid = recs[i].ssid[0] ? (const char *)recs[i].ssid : "(hidden)";
-        printf("CSV,%lld,%s,%s,%d,%d,%d,%s,%s\n",
-               (long long)ts, ssid, bssid,
-               recs[i].primary, real_channel(&recs[i]),
-               recs[i].rssi,
-               auth_mode_to_str(recs[i].authmode), phy);
-    }
-    printf("#CSV_END\n\n");
-
-    free(recs);
 }
 
 static void init_nvs(void)
@@ -140,6 +255,13 @@ static void init_nvs(void)
 
 void app_main(void)
 {
+    /* Silencia todos los logs excepto el de la IP */
+    esp_log_level_set("*", ESP_LOG_NONE);
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+
+    s_wifi_events = xEventGroupCreate();
+    s_scan_mutex  = xSemaphoreCreateMutex();
+
     init_nvs();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -147,11 +269,24 @@ void app_main(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
 
-    while (1) {
-        escanear_y_mostrar_redes();
-        vTaskDelay(pdMS_TO_TICKS(SCAN_INTERVAL_MS));
-    }
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);               /* respuesta más rápida del servidor */
+
+    /* Espera a tener IP y recién ahí levanta el servidor */
+    xEventGroupWaitBits(s_wifi_events, GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    start_webserver();
 }
