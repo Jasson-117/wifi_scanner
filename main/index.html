@@ -40,6 +40,12 @@
   .meter { display: inline-block; width: 46px; height: 6px; border-radius: 3px; background: #8883; margin-right: 6px; vertical-align: middle; overflow: hidden; }
   .meter > i { display: block; height: 100%; background: var(--c, var(--none)); }
   .muted { opacity: .6; }
+
+  /* Congestión */
+  #congestion { border: 1px solid #8884; border-radius: 8px; padding: 10px; margin-bottom: 14px; }
+  #congestion svg { width: 100%; height: auto; display: block; }
+  .rec { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: .9rem; }
+  .note { font-size: .8rem; opacity: .65; margin: 8px 0 0; }
 </style>
 </head>
 <body>
@@ -52,6 +58,8 @@
 </div>
 
 <div id="summary"></div>
+
+<div id="congestion" hidden></div>
 
 <div class="wrap">
   <table>
@@ -222,10 +230,123 @@ function renderRows() {
 
 function render() {
   renderSummary();
+  renderCongestion();
   const shown = renderRows();
   let msg = `Total: ${last.total} (mostrando ${last.shown})`;
   if (filter) msg += ` · Filtro: ${filter.value} (${shown} redes)`;
   $('status').textContent = msg;
+}
+
+/* ---------------- Análisis de congestión (2.4 GHz) ---------------- */
+const CHANNELS = Array.from({ length: 13 }, (_, i) => i + 1);
+const REC_CHANNELS = [1, 6, 11];   // los tres canales que no se solapan entre sí
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+/* Qué fracción de un canal de 20 MHz queda tapada por esta red.
+   Los canales están separados 5 MHz; ap.channel es el centro real. */
+function overlapFraction(ap, ch) {
+  const apLo = ap.channel * 5 - ap.bw / 2, apHi = ap.channel * 5 + ap.bw / 2;
+  const chLo = ch * 5 - 10, chHi = ch * 5 + 10;
+  return Math.max(0, Math.min(apHi, chHi) - Math.max(apLo, chLo)) / 20;
+}
+
+/* Peso por potencia: -95 dBm o menos no cuenta, -45 dBm o más pesa 1 */
+function signalWeight(rssi) {
+  return Math.max(0, Math.min(1, (rssi + 95) / 50));
+}
+
+function congestionLevel(score) {
+  if (score < 25) return { label: 'Libre',    level: 'good' };
+  if (score < 50) return { label: 'Moderada', level: 'ok' };
+  if (score < 75) return { label: 'Alta',     level: 'warn' };
+  return                 { label: 'Saturada', level: 'bad' };
+}
+
+function analyzeCongestion(list) {
+  return CHANNELS.map(ch => {
+    let load = 0;
+    for (const ap of list) load += overlapFraction(ap, ch) * signalWeight(ap.rssi);
+    const score = Math.min(100, Math.round(load * 25));   // ~4 redes fuertes = saturado
+    return {
+      ch, score, ...congestionLevel(score),
+      count: list.filter(ap => ap.primary === ch).length
+    };
+  });
+}
+
+function svgEl(name, attrs, text) {
+  const e = document.createElementNS(SVGNS, name);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function renderCongestion() {
+  const box = $('congestion');
+  const res = analyzeCongestion(aps);
+  const best = REC_CHANNELS.map(c => res[c - 1]).reduce((a, b) => (b.score < a.score ? b : a));
+
+  box.replaceChildren();
+  box.hidden = false;
+  const h = document.createElement('h2');
+  h.textContent = 'Congestión por canal (2.4 GHz)';
+  box.appendChild(h);
+
+  /* Gráfica de barras: una por canal, con su puntaje de 0 a 100 */
+  const W = 650, H = 230, base = 170, maxH = 130, x0 = 36, step = 46, bw = 34;
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': 'Congestión por canal' });
+
+  for (const g of [0, 25, 50, 75, 100]) {
+    const y = base - (g / 100) * maxH;
+    svg.appendChild(svgEl('line', { x1: x0 - 6, x2: W - 10, y1: y, y2: y, stroke: 'currentColor', 'stroke-opacity': 0.15 }));
+    svg.appendChild(svgEl('text', { x: x0 - 10, y: y + 4, 'text-anchor': 'end', 'font-size': 10, fill: 'currentColor', opacity: 0.6 }, g));
+  }
+
+  res.forEach((r, i) => {
+    const x = x0 + i * step + 4;
+    const cx = x + bw / 2;
+    const barH = Math.max(2, (r.score / 100) * maxH);
+    const isRec = REC_CHANNELS.includes(r.ch);
+
+    svg.appendChild(svgEl('rect', {
+      x, y: base - barH, width: bw, height: barH, rx: 4,
+      fill: `var(--${r.level})`, 'fill-opacity': isRec ? 1 : 0.6
+    }));
+    svg.appendChild(svgEl('text', { x: cx, y: base - barH - 5, 'text-anchor': 'middle', 'font-size': 11, fill: 'currentColor' }, r.score));
+    if (r.ch === best.ch) {
+      svg.appendChild(svgEl('text', { x: cx, y: base - barH - 19, 'text-anchor': 'middle', 'font-size': 13, fill: 'var(--warn)' }, '★'));
+    }
+    svg.appendChild(svgEl('text', {
+      x: cx, y: base + 16, 'text-anchor': 'middle', 'font-size': 12,
+      'font-weight': isRec ? 700 : 400, fill: 'currentColor'
+    }, r.ch));
+    svg.appendChild(svgEl('text', {
+      x: cx, y: base + 31, 'text-anchor': 'middle', 'font-size': 10, fill: 'currentColor', opacity: 0.6
+    }, r.count ? `${r.count} red${r.count > 1 ? 'es' : ''}` : '–'));
+  });
+  box.appendChild(svg);
+
+  /* Recomendación entre 1, 6 y 11 */
+  const rec = document.createElement('div');
+  rec.className = 'rec';
+  const lead = document.createElement('strong');
+  lead.textContent = `Canal recomendado: ${best.ch}`;
+  rec.appendChild(lead);
+  for (const c of REC_CHANNELS) {
+    const r = res[c - 1];
+    const s = document.createElement('span');
+    s.className = 'badge ' + r.level;
+    s.textContent = `Canal ${c}: ${r.score}/100 · ${r.label}` + (c === best.ch ? ' ★' : '');
+    rec.appendChild(s);
+  }
+  box.appendChild(rec);
+
+  const note = document.createElement('p');
+  note.className = 'note';
+  note.textContent = 'Ocupación estimada según cuántas redes se solapan con cada canal y qué tan fuerte se oyen. ' +
+    'Debajo de cada canal se indica cuántas redes lo usan como canal principal. ' +
+    'Es un solo escaneo, medido desde donde está el ESP32.';
+  box.appendChild(note);
 }
 
 /* ---------------- Escaneo y CSV ---------------- */
