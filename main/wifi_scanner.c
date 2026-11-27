@@ -12,6 +12,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
+#include "esp_random.h"
+#include <stdarg.h>
 
 /* ---------- Configura tu red (solo 2.4 GHz) ---------- */
 #define WIFI_SSID "fh_0ef478"
@@ -19,6 +22,7 @@
 
 #define MAX_AP_RECORDS 32
 #define GOT_IP_BIT     BIT0
+#define MAX_SEND       120   /* máx. escaneos por respuesta de /api/history */
 
 static const char *TAG = "WIFI_SCAN";
 static EventGroupHandle_t s_wifi_events;
@@ -158,51 +162,208 @@ static esp_err_t index_handler(httpd_req_t *req)
     return httpd_resp_send(req, index_html_start, HTTPD_RESP_USE_STRLEN);
 }
 
-/* GET /api/scan -> ejecuta el escaneo y devuelve JSON */
-static esp_err_t scan_handler(httpd_req_t *req)
-{
-    if (xSemaphoreTake(s_scan_mutex, 0) != pdTRUE) {
-        return send_error(req, "409 Conflict", "Ya hay un escaneo en curso");
-    }
+/* ---------- Historial: buffer circular en PSRAM (o RAM si no hay) ---------- */
+typedef struct {
+    uint8_t bssid[6];
+    char    ssid[33];
+    int8_t  rssi;
+    uint8_t primary, second, authmode, phy;   /* phy: bit0=b bit1=g bit2=n */
+} ap_entry_t;
 
+typedef struct {
+    int64_t    ts_ms;
+    uint16_t   total, count;
+    ap_entry_t aps[MAX_AP_RECORDS];
+} snapshot_t;
+
+static snapshot_t *s_hist;
+static int s_cap, s_len;
+static bool s_psram;
+static uint32_t s_seq_next = 1;          /* el escaneo n se guarda en la posición (n-1) % cap */
+static uint32_t s_boot_id;               /* cambia en cada reinicio: el navegador lo detecta */
+static volatile uint32_t s_auto_s;       /* intervalo del escaneo automático; 0 = apagado */
+static SemaphoreHandle_t s_hist_mutex;
+
+static void history_init(void)
+{
+    s_hist_mutex = xSemaphoreCreateMutex();
+    s_boot_id = esp_random();
+    s_hist = heap_caps_calloc(120, sizeof(snapshot_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_hist) { s_cap = 120; s_psram = true; return; }
+    s_hist = heap_caps_calloc(30, sizeof(snapshot_t), MALLOC_CAP_8BIT);
+    s_cap = s_hist ? 30 : 0;
+}
+
+static uint32_t store_snapshot(const wifi_ap_record_t *recs, uint16_t n, uint16_t total)
+{
+    if (!s_cap) return 0;
+    xSemaphoreTake(s_hist_mutex, portMAX_DELAY);
+    uint32_t seq = s_seq_next++;
+    snapshot_t *sn = &s_hist[(seq - 1) % s_cap];
+    sn->ts_ms = esp_timer_get_time() / 1000;
+    sn->total = total;
+    sn->count = n;
+    for (uint16_t i = 0; i < n; i++) {
+        ap_entry_t *e = &sn->aps[i];
+        const wifi_ap_record_t *r = &recs[i];
+        memcpy(e->bssid, r->bssid, 6);
+        strlcpy(e->ssid, (const char *)r->ssid, sizeof(e->ssid));
+        e->rssi = r->rssi;
+        e->primary = r->primary;
+        e->second = r->second;
+        e->authmode = r->authmode;
+        e->phy = r->phy_11b | (r->phy_11g << 1) | (r->phy_11n << 2);
+    }
+    if (s_len < s_cap) s_len++;
+    xSemaphoreGive(s_hist_mutex);
+    return seq;
+}
+
+/* Escanea y guarda en el historial. ESP_ERR_INVALID_STATE = ya hay un escaneo en curso */
+static esp_err_t scan_and_store(uint32_t *seq_out)
+{
+    if (xSemaphoreTake(s_scan_mutex, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
     wifi_ap_record_t *recs = NULL;
     uint16_t n = 0, total = 0;
     esp_err_t err = do_scan(&recs, &n, &total);
-    xSemaphoreGive(s_scan_mutex);
-
-    if (err != ESP_OK) {
-        return send_error(req, "500 Internal Server Error", "Error al escanear, intenta de nuevo");
+    if (err == ESP_OK) {
+        uint32_t seq = store_snapshot(recs, n, total);
+        if (seq_out) *seq_out = seq;
     }
-
-    int64_t ts = esp_timer_get_time() / 1000;
-    char buf[420];
-
-    httpd_resp_set_type(req, "application/json");
-    int len = snprintf(buf, sizeof(buf),
-                       "{\"timestamp_ms\":%lld,\"total\":%u,\"shown\":%u,\"aps\":[",
-                       (long long)ts, total, n);
-    httpd_resp_send_chunk(req, buf, len);
-
-    for (uint16_t i = 0; i < n; i++) {
-        char ssid_esc[200], bssid[18], phy[8];
-        mac_to_str(recs[i].bssid, bssid);
-        phy_to_str(&recs[i], phy);
-        json_escape((const char *)recs[i].ssid, ssid_esc, sizeof(ssid_esc));
-
-        len = snprintf(buf, sizeof(buf),
-                       "%s{\"ssid\":\"%s\",\"bssid\":\"%s\",\"primary\":%d,\"channel\":%d,"
-                       "\"rssi\":%d,\"phy\":\"%s\",\"auth\":\"%s\"}",
-                       i ? "," : "", ssid_esc, bssid,
-                       recs[i].primary, real_channel(&recs[i]),
-                       recs[i].rssi, phy, auth_mode_to_str(recs[i].authmode));
-        httpd_resp_send_chunk(req, buf, len);
-    }
-
-    httpd_resp_send_chunk(req, "]}", 2);
-    httpd_resp_send_chunk(req, NULL, 0);   /* fin de la respuesta */
-
     free(recs);
-    return ESP_OK;
+    xSemaphoreGive(s_scan_mutex);
+    return err;
+}
+
+static void auto_scan_task(void *arg)
+{
+    uint32_t waited = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (s_auto_s == 0) { waited = 0; continue; }
+        if (++waited >= s_auto_s) {
+            waited = 0;
+            scan_and_store(NULL);
+        }
+    }
+}
+
+/* ---------- JSON por bloques (agrupa en 1 KB antes de enviar) ---------- */
+typedef struct { httpd_req_t *req; size_t len; char buf[1024]; } jw_t;
+
+static void jw_flush(jw_t *w)
+{
+    if (w->len) httpd_resp_send_chunk(w->req, w->buf, w->len);
+    w->len = 0;
+}
+
+static void jw_printf(jw_t *w, const char *fmt, ...)
+{
+    char tmp[480];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n >= (int)sizeof(tmp)) n = sizeof(tmp) - 1;
+    if (w->len + n > sizeof(w->buf)) jw_flush(w);
+    memcpy(w->buf + w->len, tmp, n);
+    w->len += n;
+}
+
+static void jw_snapshot(jw_t *w, uint32_t seq, const snapshot_t *sn)
+{
+    jw_printf(w, "{\"seq\":%u,\"timestamp_ms\":%lld,\"total\":%u,\"shown\":%u,\"aps\":[",
+              (unsigned)seq, (long long)sn->ts_ms, sn->total, sn->count);
+    for (uint16_t i = 0; i < sn->count; i++) {
+        const ap_entry_t *e = &sn->aps[i];
+        char ssid_esc[200], bssid[18], phy[8];
+        int k = 0, ch2 = e->primary;
+        mac_to_str(e->bssid, bssid);
+        json_escape(e->ssid, ssid_esc, sizeof(ssid_esc));
+        if (e->phy & 1) phy[k++] = 'b';
+        if (e->phy & 2) phy[k++] = 'g';
+        if (e->phy & 4) phy[k++] = 'n';
+        if (!k) phy[k++] = '?';
+        phy[k] = '\0';
+        if (e->second == WIFI_SECOND_CHAN_ABOVE) ch2 += 4;
+        else if (e->second == WIFI_SECOND_CHAN_BELOW) ch2 -= 4;
+        jw_printf(w, "%s{\"ssid\":\"%s\",\"bssid\":\"%s\",\"primary\":%d,\"channel\":%d,"
+                     "\"rssi\":%d,\"phy\":\"%s\",\"auth\":\"%s\"}",
+                  i ? "," : "", ssid_esc, bssid, e->primary, ch2, e->rssi, phy,
+                  auth_mode_to_str((wifi_auth_mode_t)e->authmode));
+    }
+    jw_printf(w, "]}");
+}
+
+/* ---------- Handlers ---------- */
+
+/* GET /api/scan -> escanea ahora, guarda en el historial y devuelve ese escaneo */
+static esp_err_t scan_handler(httpd_req_t *req)
+{
+    uint32_t seq = 0;
+    esp_err_t err = scan_and_store(&seq);
+    if (err == ESP_ERR_INVALID_STATE) return send_error(req, "409 Conflict", "Ya hay un escaneo en curso");
+    if (err != ESP_OK || !seq) return send_error(req, "500 Internal Server Error", "Error al escanear, intenta de nuevo");
+
+    jw_t w = { .req = req };
+    httpd_resp_set_type(req, "application/json");
+    xSemaphoreTake(s_hist_mutex, portMAX_DELAY);
+    jw_snapshot(&w, seq, &s_hist[(seq - 1) % s_cap]);
+    xSemaphoreGive(s_hist_mutex);
+    jw_flush(&w);
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/* GET /api/history?after=SEQ&boot=ID -> solo los escaneos nuevos */
+static esp_err_t history_handler(httpd_req_t *req)
+{
+    char q[64] = "", v[16];
+    uint32_t after = 0, boot = 0;
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "after", v, sizeof(v)) == ESP_OK) after = strtoul(v, NULL, 10);
+        if (httpd_query_key_value(q, "boot", v, sizeof(v)) == ESP_OK) boot = strtoul(v, NULL, 10);
+    }
+    bool reset = (boot != s_boot_id);   /* el ESP32 se reinició: el navegador debe empezar de cero */
+    if (reset) after = 0;
+
+    jw_t w = { .req = req };
+    httpd_resp_set_type(req, "application/json");
+
+    xSemaphoreTake(s_hist_mutex, portMAX_DELAY);
+    uint32_t latest = s_seq_next - 1;
+    uint32_t oldest = s_seq_next - s_len;
+    uint32_t start = after + 1;
+    if (start < oldest) start = oldest;
+    if (latest >= MAX_SEND && start < latest - MAX_SEND + 1) start = latest - MAX_SEND + 1;
+
+    jw_printf(&w, "{\"boot\":%u,\"reset\":%s,\"latest\":%u,\"cap\":%d,\"psram\":%s,\"interval\":%u,\"snaps\":[",
+              (unsigned)s_boot_id, reset ? "true" : "false", (unsigned)latest, s_cap,
+              s_psram ? "true" : "false", (unsigned)s_auto_s);
+    for (uint32_t k = start; k <= latest; k++) {
+        if (k > start) jw_printf(&w, ",");
+        jw_snapshot(&w, k, &s_hist[(k - 1) % s_cap]);
+    }
+    xSemaphoreGive(s_hist_mutex);
+
+    jw_printf(&w, "]}");
+    jw_flush(&w);
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+/* POST /api/auto?interval=N -> escaneo automático cada N s (0 = apagado, mín. 10) */
+static esp_err_t auto_handler(httpd_req_t *req)
+{
+    char q[32] = "", v[12];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "interval", v, sizeof(v)) == ESP_OK) {
+        uint32_t n = strtoul(v, NULL, 10);
+        s_auto_s = (n == 0) ? 0 : (n < 10 ? 10 : (n > 3600 ? 3600 : n));
+    }
+    char body[40];
+    snprintf(body, sizeof(body), "{\"interval\":%u}", (unsigned)s_auto_s);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
 }
 
 static void start_webserver(void)
@@ -216,14 +377,15 @@ static void start_webserver(void)
         return;
     }
 
-    static const httpd_uri_t index_uri = {
-        .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL
+    static const httpd_uri_t uris[] = {
+        { .uri = "/",            .method = HTTP_GET,  .handler = index_handler },
+        { .uri = "/api/scan",    .method = HTTP_GET,  .handler = scan_handler },
+        { .uri = "/api/history", .method = HTTP_GET,  .handler = history_handler },
+        { .uri = "/api/auto",    .method = HTTP_POST, .handler = auto_handler },
     };
-    static const httpd_uri_t scan_uri = {
-        .uri = "/api/scan", .method = HTTP_GET, .handler = scan_handler, .user_ctx = NULL
-    };
-    httpd_register_uri_handler(server, &index_uri);
-    httpd_register_uri_handler(server, &scan_uri);
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+        httpd_register_uri_handler(server, &uris[i]);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -261,6 +423,8 @@ void app_main(void)
 
     s_wifi_events = xEventGroupCreate();
     s_scan_mutex  = xSemaphoreCreateMutex();
+    history_init();
+    xTaskCreate(auto_scan_task, "auto_scan", 4096, NULL, 5, NULL);
 
     init_nvs();
     ESP_ERROR_CHECK(esp_netif_init());

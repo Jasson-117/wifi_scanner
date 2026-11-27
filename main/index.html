@@ -46,6 +46,13 @@
   #congestion svg { width: 100%; height: auto; display: block; }
   .rec { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: .9rem; }
   .note { font-size: .8rem; opacity: .65; margin: 8px 0 0; }
+
+  /* Historial */
+  #stats .group { margin-bottom: 12px; }
+  #stats svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: .8rem; margin-top: 4px; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+  select { font: inherit; padding: 6px; border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -54,18 +61,25 @@
 <div class="bar">
   <button class="btn" id="scan">Iniciar escaneo</button>
   <button class="btn" id="csv" disabled>Descargar CSV</button>
+  <label>Auto: <select id="auto">
+    <option value="0">Apagado</option><option value="10">cada 10 s</option>
+    <option value="30">cada 30 s</option><option value="60">cada 1 min</option>
+  </select></label>
   <span id="status"></span>
+  <span id="histInfo" class="muted"></span>
 </div>
 
 <div id="summary"></div>
 
 <div id="congestion" hidden></div>
 
+<div id="stats" hidden></div>
+
 <div class="wrap">
   <table>
     <thead>
       <tr>
-        <th>SSID</th><th>BSSID</th><th>Canal</th><th>RSSI</th><th>Señal</th>
+        <th>SSID</th><th>BSSID</th><th title="Canal principal (entre paréntesis el canal secundario si usa 40 MHz)">Canal</th><th>RSSI</th><th>Señal</th>
         <th>Seguridad</th><th>Ancho</th><th>Estándar</th><th>Notas</th>
       </tr>
     </thead>
@@ -113,6 +127,8 @@ function enrich(aps) {
     sec: SEC[ap.auth] || { label: ap.auth, level: '', note: 'Desconocida' },
     sig: signalClass(ap.rssi),
     bw: ap.primary !== ap.channel ? 40 : 20,   // HT40 si hay canal secundario
+    // ap.channel es el canal SECUNDARIO cuando usa 40 MHz; el centro queda entre ambos
+    center: (ap.primary + ap.channel) / 2,
     std: standardClass(ap.phy),
     hidden: !ap.ssid,
     multi: ap.ssid ? perSsid[ap.ssid] : 1
@@ -231,6 +247,7 @@ function renderRows() {
 function render() {
   renderSummary();
   renderCongestion();
+  renderStats();
   const shown = renderRows();
   let msg = `Total: ${last.total} (mostrando ${last.shown})`;
   if (filter) msg += ` · Filtro: ${filter.value} (${shown} redes)`;
@@ -243,9 +260,9 @@ const REC_CHANNELS = [1, 6, 11];   // los tres canales que no se solapan entre s
 const SVGNS = 'http://www.w3.org/2000/svg';
 
 /* Qué fracción de un canal de 20 MHz queda tapada por esta red.
-   Los canales están separados 5 MHz; ap.channel es el centro real. */
+   Los canales están separados 5 MHz; ap.center es el centro del bloque que ocupa. */
 function overlapFraction(ap, ch) {
-  const apLo = ap.channel * 5 - ap.bw / 2, apHi = ap.channel * 5 + ap.bw / 2;
+  const apLo = ap.center * 5 - ap.bw / 2, apHi = ap.center * 5 + ap.bw / 2;
   const chLo = ch * 5 - 10, chHi = ch * 5 + 10;
   return Math.max(0, Math.min(apHi, chHi) - Math.max(apLo, chLo)) / 20;
 }
@@ -363,6 +380,7 @@ async function scan() {
     filter = null;
     render();
     $('csv').disabled = false;
+    syncHistory();
   } catch (e) {
     $('status').textContent = 'Error: ' + e.message;
   } finally {
@@ -373,7 +391,7 @@ async function scan() {
 function downloadCsv() {
   if (!last) return;
   const q = s => '"' + String(s).replace(/"/g, '""') + '"';
-  const lines = ['timestamp_ms,ssid,bssid,channel,real_channel,rssi,auth,phy,seguridad,senal,ancho_mhz,estandar,oculta,multi_ap'];
+  const lines = ['timestamp_ms,ssid,bssid,channel,sec_channel,rssi,auth,phy,seguridad,senal,ancho_mhz,estandar,oculta,multi_ap'];
   for (const ap of aps) {
     lines.push([
       last.timestamp_ms, q(ap.ssid || '(hidden)'), ap.bssid,
@@ -389,6 +407,114 @@ function downloadCsv() {
   a.click();
   URL.revokeObjectURL(a.href);
 }
+
+/* ---------------- Historial y estadísticas ---------------- */
+const PAL = ['#e6550d', '#3182bd', '#31a354', '#9467bd', '#d6a300'];
+let hist = [], boot = 0, histCap = 120;
+
+async function syncHistory() {
+  if (document.hidden) return;
+  try {
+    const after = hist.length ? hist[hist.length - 1].seq : 0;
+    const d = await (await fetch(`/api/history?after=${after}&boot=${boot}`)).json();
+    if (d.reset) hist = [];
+    boot = d.boot;
+    histCap = d.cap || 120;
+    $('auto').value = String(d.interval);
+    for (const sn of d.snaps) hist.push({ ...sn, aps: enrich(sn.aps) });
+    while (hist.length > histCap) hist.shift();
+    $('histInfo').textContent = `Historial: ${hist.length}/${d.cap} escaneos${d.psram ? ' (PSRAM)' : ''}`;
+    if (d.snaps.length) {
+      last = hist[hist.length - 1];
+      aps = last.aps;
+      $('csv').disabled = false;
+      render();
+    }
+  } catch (e) { /* el ESP32 está escaneando; se reintenta en el próximo ciclo */ }
+}
+
+function fmtAgo(ms) {
+  const s = Math.round(ms / 1000);
+  return s === 0 ? 'ahora' : s < 60 ? `-${s}s` : `-${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+/* Gráfica de líneas genérica: series = [{ name, color, pts: [valor | null] }] */
+function lineChart(title, xs, series, ymin, ymax, yticks) {
+  const W = 650, H = 210, L = 40, R = 10, T = 10, B = 28, pw = W - L - R, ph = H - T - B;
+  const t0 = xs[0], t1 = xs[xs.length - 1], span = Math.max(1, t1 - t0);
+  const X = i => L + (xs.length > 1 ? ((xs[i] - t0) / span) * pw : pw / 2);
+  const Y = v => T + (1 - (v - ymin) / (ymax - ymin)) * ph;
+
+  const div = document.createElement('div');
+  div.className = 'group';
+  const h = document.createElement('h2');
+  h.textContent = title;
+  const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': title });
+
+  for (const g of yticks) {
+    svg.appendChild(svgEl('line', { x1: L, x2: W - R, y1: Y(g), y2: Y(g), stroke: 'currentColor', 'stroke-opacity': 0.15 }));
+    svg.appendChild(svgEl('text', { x: L - 6, y: Y(g) + 4, 'text-anchor': 'end', 'font-size': 10, fill: 'currentColor', opacity: 0.6 }, g));
+  }
+  for (const f of [0, 0.5, 1]) {
+    svg.appendChild(svgEl('text', {
+      x: L + f * pw, y: H - 8, 'font-size': 10, fill: 'currentColor', opacity: 0.6,
+      'text-anchor': f === 0 ? 'start' : f === 1 ? 'end' : 'middle'
+    }, fmtAgo(t1 - (t0 + f * span))));
+  }
+  for (const sr of series) {
+    let d = '', pen = false;
+    sr.pts.forEach((v, i) => {
+      if (v == null) { pen = false; return; }
+      d += `${pen ? 'L' : 'M'}${X(i).toFixed(1)} ${Y(v).toFixed(1)} `;
+      pen = true;
+      svg.appendChild(svgEl('circle', { cx: X(i), cy: Y(v), r: 2.2, fill: sr.color }));
+    });
+    svg.insertBefore(svgEl('path', { d, fill: 'none', stroke: sr.color, 'stroke-width': 2 }), svg.lastChild);
+  }
+
+  const legend = document.createElement('div');
+  legend.className = 'legend';
+  for (const sr of series) {
+    const item = document.createElement('span');
+    const sw = document.createElement('i');
+    sw.className = 'sw';
+    sw.style.background = sr.color;
+    item.append(sw, sr.name);
+    legend.appendChild(item);
+  }
+  div.append(h, svg, legend);
+  return div;
+}
+
+function renderStats() {
+  const box = $('stats');
+  if (!hist.length) return;
+  box.hidden = false;
+  box.replaceChildren();
+  const xs = hist.map(x => x.timestamp_ms);
+
+  // 1) RSSI en el tiempo de las 5 redes (BSSID) con mejor señal promedio
+  const stat = {};
+  for (const x of hist) for (const a of x.aps) {
+    const e = (stat[a.bssid] ||= { name: `${a.ssid || '<OCULTO>'} (${a.bssid.slice(-5)})`, sum: 0, n: 0 });
+    e.sum += a.rssi; e.n++;
+  }
+  const top = Object.entries(stat).sort((p, q) => q[1].sum / q[1].n - p[1].sum / p[1].n).slice(0, 5);
+  const rssi = top.map(([b, e], i) => ({
+    name: e.name, color: PAL[i],
+    pts: hist.map(x => { const a = x.aps.find(k => k.bssid === b); return a ? a.rssi : null; })
+  }));
+  box.appendChild(lineChart('Señal en el tiempo (5 redes más fuertes, dBm)', xs, rssi, -100, -30, [-100, -80, -60, -40]));
+
+  // 2) Congestión de los canales 1, 6 y 11 en cada escaneo
+  const cong = hist.map(x => analyzeCongestion(x.aps));
+  const cs = REC_CHANNELS.map((c, i) => ({ name: `Canal ${c}`, color: PAL[i], pts: cong.map(r => r[c - 1].score) }));
+  box.appendChild(lineChart('Congestión en el tiempo (0-100)', xs, cs, 0, 100, [0, 25, 50, 75, 100]));
+}
+
+$('auto').addEventListener('change', e => fetch('/api/auto?interval=' + e.target.value, { method: 'POST' }));
+syncHistory();
+setInterval(syncHistory, 5000);
 
 $('scan').addEventListener('click', scan);
 $('csv').addEventListener('click', downloadCsv);
